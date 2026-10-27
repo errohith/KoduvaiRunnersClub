@@ -1,0 +1,836 @@
+// Koduvai Runners — PostgreSQL schema
+// Conventions:
+//   * UUID primary keys everywhere.
+//   * Money is stored as integer minor units (paise for INR) + ISO currency code. Never floats.
+//   * All timestamps are timestamptz (UTC); they are rendered in APP_TIMEZONE.
+//   * Constraints Prisma cannot express (partial unique indexes, CHECKs) live in
+//     prisma/migrations/*_constraints/migration.sql.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_DATABASE_URL")
+}
+
+// ───────────────────────────── Identity & access ─────────────────────────────
+
+model User {
+  id           String    @id @default(uuid()) @db.Uuid
+  email        String    @unique
+  name         String
+  passwordHash String    @map("password_hash")
+  isActive     Boolean   @default(true) @map("is_active")
+  lastLoginAt  DateTime? @map("last_login_at") @db.Timestamptz
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  roles          UserRole[]
+  sessions       Session[]
+  auditLogs      AuditLog[]
+  reviewedApps   MembershipApplication[] @relation("ApplicationReviewer")
+  statusChanges  MembershipStatusHistory[]
+  campaigns      NotificationCampaign[]
+  mediaUploads   MediaAsset[]
+  refunds        Refund[]
+
+  @@map("users")
+}
+
+model Role {
+  id          String           @id @default(uuid()) @db.Uuid
+  key         String           @unique
+  name        String
+  description String?
+  createdAt   DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  permissions RolePermission[]
+  users       UserRole[]
+
+  @@map("roles")
+}
+
+model Permission {
+  id          String           @id @default(uuid()) @db.Uuid
+  key         String           @unique
+  description String?
+  roles       RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String     @map("role_id") @db.Uuid
+  permissionId String     @map("permission_id") @db.Uuid
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model UserRole {
+  userId String @map("user_id") @db.Uuid
+  roleId String @map("role_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role   Role   @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+  @@index([roleId])
+  @@map("user_roles")
+}
+
+model Session {
+  id         String   @id @default(uuid()) @db.Uuid
+  tokenHash  String   @unique @map("token_hash")
+  userId     String   @map("user_id") @db.Uuid
+  expiresAt  DateTime @map("expires_at") @db.Timestamptz
+  ip         String?
+  userAgent  String?  @map("user_agent")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+model RateLimitBucket {
+  key         String   @id
+  count       Int      @default(0)
+  windowStart DateTime @map("window_start") @db.Timestamptz
+
+  @@map("rate_limit_buckets")
+}
+
+// ───────────────────────────── Website content ─────────────────────────────
+
+model WebsiteSetting {
+  key         String   @id
+  value       Json
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  updatedById String?  @map("updated_by_id") @db.Uuid
+
+  @@map("website_settings")
+}
+
+model WebsitePage {
+  id              String           @id @default(uuid()) @db.Uuid
+  slug            String           @unique
+  title           String
+  metaDescription String?          @map("meta_description")
+  body            String?          // Markdown
+  isPublished     Boolean          @default(true) @map("is_published")
+  createdAt       DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime         @updatedAt @map("updated_at") @db.Timestamptz
+  sections        ContentSection[]
+
+  @@map("website_pages")
+}
+
+model ContentSection {
+  id          String      @id @default(uuid()) @db.Uuid
+  pageId      String      @map("page_id") @db.Uuid
+  key         String
+  title       String?
+  subtitle    String?
+  body        String?     // Markdown
+  // Repeating items ("Label | Value | Detail" per line) for stats, highlights, values, FAQs.
+  items       Json        @default("[]")
+  imageId     String?     @map("image_id") @db.Uuid
+  ctaLabel    String?     @map("cta_label")
+  ctaHref     String?     @map("cta_href")
+  sortOrder   Int         @default(0) @map("sort_order")
+  isPublished Boolean     @default(true) @map("is_published")
+  updatedAt   DateTime    @updatedAt @map("updated_at") @db.Timestamptz
+  page        WebsitePage @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  image       MediaAsset? @relation(fields: [imageId], references: [id], onDelete: SetNull)
+
+  @@unique([pageId, key])
+  @@map("content_sections")
+}
+
+enum NavLocation {
+  HEADER
+  FOOTER
+}
+
+model NavigationLink {
+  id        String      @id @default(uuid()) @db.Uuid
+  label     String
+  href      String
+  location  NavLocation
+  sortOrder Int         @default(0) @map("sort_order")
+  isActive  Boolean     @default(true) @map("is_active")
+
+  @@index([location, sortOrder])
+  @@map("navigation_links")
+}
+
+model MediaAsset {
+  id           String           @id @default(uuid()) @db.Uuid
+  storageKey   String           @unique @map("storage_key")
+  url          String
+  originalName String           @map("original_name")
+  mimeType     String           @map("mime_type")
+  sizeBytes    Int              @map("size_bytes")
+  altText      String           @default("") @map("alt_text")
+  caption      String?
+  albumId      String?          @map("album_id") @db.Uuid
+  sortOrder    Int              @default(0) @map("sort_order")
+  uploadedById String?          @map("uploaded_by_id") @db.Uuid
+  createdAt    DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  album        GalleryAlbum?    @relation("AlbumMedia", fields: [albumId], references: [id], onDelete: SetNull)
+  uploadedBy   User?            @relation(fields: [uploadedById], references: [id], onDelete: SetNull)
+  sections     ContentSection[]
+  newsCovers   NewsPost[]
+  eventCovers  Event[]
+  committee    CommitteeMember[]
+  albumCovers  GalleryAlbum[]   @relation("AlbumCover")
+
+  @@index([albumId, sortOrder])
+  @@map("media_assets")
+}
+
+model GalleryAlbum {
+  id          String       @id @default(uuid()) @db.Uuid
+  slug        String       @unique
+  title       String
+  description String?
+  takenOn     DateTime?    @map("taken_on") @db.Date
+  coverId     String?      @map("cover_id") @db.Uuid
+  isPublished Boolean      @default(true) @map("is_published")
+  createdAt   DateTime     @default(now()) @map("created_at") @db.Timestamptz
+  cover       MediaAsset?  @relation("AlbumCover", fields: [coverId], references: [id], onDelete: SetNull)
+  media       MediaAsset[] @relation("AlbumMedia")
+
+  @@map("gallery_albums")
+}
+
+enum PublishStatus {
+  DRAFT
+  PUBLISHED
+}
+
+model NewsPost {
+  id          String        @id @default(uuid()) @db.Uuid
+  slug        String        @unique
+  title       String
+  excerpt     String?
+  body        String        // Markdown
+  category    String        @default("Announcement")
+  status      PublishStatus @default(DRAFT)
+  publishedAt DateTime?     @map("published_at") @db.Timestamptz
+  coverId     String?       @map("cover_id") @db.Uuid
+  createdAt   DateTime      @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime      @updatedAt @map("updated_at") @db.Timestamptz
+  cover       MediaAsset?   @relation(fields: [coverId], references: [id], onDelete: SetNull)
+
+  @@index([status, publishedAt])
+  @@map("news_posts")
+}
+
+model CommitteeMember {
+  id        String      @id @default(uuid()) @db.Uuid
+  name      String
+  role      String
+  bio       String?
+  photoId   String?     @map("photo_id") @db.Uuid
+  sortOrder Int         @default(0) @map("sort_order")
+  isActive  Boolean     @default(true) @map("is_active")
+  photo     MediaAsset? @relation(fields: [photoId], references: [id], onDelete: SetNull)
+
+  @@map("committee_members")
+}
+
+model Testimonial {
+  id        String  @id @default(uuid()) @db.Uuid
+  quote     String
+  author    String
+  context   String?
+  sortOrder Int     @default(0) @map("sort_order")
+  isActive  Boolean @default(true) @map("is_active")
+
+  @@map("testimonials")
+}
+
+// ───────────────────────────── Membership ─────────────────────────────
+
+model MembershipPlan {
+  id                          String   @id @default(uuid()) @db.Uuid
+  code                        String   @unique
+  name                        String
+  description                 String
+  feeMinor                    Int      @map("fee_minor")
+  currency                    String   @default("INR") @db.Char(3)
+  benefits                    String[] @default([])
+  eligibility                 String?
+  requiresStudentVerification Boolean  @default(false) @map("requires_student_verification")
+  // null = follow the club-wide "membership.requireApproval" setting.
+  requiresApproval            Boolean? @map("requires_approval")
+  // null = no expiry configured; the club decides renewal periods.
+  durationMonths              Int?     @map("duration_months")
+  isActive                    Boolean  @default(true) @map("is_active")
+  sortOrder                   Int      @default(0) @map("sort_order")
+  createdAt                   DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt                   DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  applications MembershipApplication[]
+  memberships  Membership[]
+
+  @@index([isActive, sortOrder])
+  @@map("membership_plans")
+}
+
+enum ApplicationStatus {
+  PENDING   // submitted, awaiting review
+  APPROVED  // approved by the club; awaiting payment for paid plans
+  ACTIVE    // approval + payment conditions satisfied; membership record exists
+  REJECTED
+  CANCELLED
+}
+
+model MembershipApplication {
+  id                 String            @id @default(uuid()) @db.Uuid
+  referenceNo        String            @unique @map("reference_no")
+  planId             String            @map("plan_id") @db.Uuid
+  // Snapshot of the fee at submission so later price edits do not change what was quoted.
+  feeMinor           Int               @map("fee_minor")
+  currency           String            @db.Char(3)
+  status             ApplicationStatus @default(PENDING)
+  approvalRequired   Boolean           @map("approval_required")
+  fullName           String            @map("full_name")
+  email              String            // stored lower-cased
+  phoneE164          String            @map("phone_e164")
+  dateOfBirth        DateTime?         @map("date_of_birth") @db.Date
+  city               String
+  address            String?
+  experienceLevel    String            @map("experience_level")
+  interests          String[]          @default([])
+  emergencyName      String?           @map("emergency_name")
+  emergencyPhone     String?           @map("emergency_phone")
+  studentInstitution String?           @map("student_institution")
+  studentIdNumber    String?           @map("student_id_number")
+  referralSource     String?           @map("referral_source")
+  photoKey           String?           @map("photo_key")
+  termsAcceptedAt    DateTime          @map("terms_accepted_at") @db.Timestamptz
+  privacyAcceptedAt  DateTime          @map("privacy_accepted_at") @db.Timestamptz
+  reviewedById       String?           @map("reviewed_by_id") @db.Uuid
+  reviewedAt         DateTime?         @map("reviewed_at") @db.Timestamptz
+  decisionNote       String?           @map("decision_note")
+  submittedIp        String?           @map("submitted_ip")
+  createdAt          DateTime          @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt          DateTime          @updatedAt @map("updated_at") @db.Timestamptz
+
+  plan          MembershipPlan            @relation(fields: [planId], references: [id], onDelete: Restrict)
+  reviewedBy    User?                     @relation("ApplicationReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  history       MembershipStatusHistory[]
+  membership    Membership?
+  payments      Payment[]
+
+  @@index([status, createdAt])
+  @@index([planId])
+  @@index([email])
+  @@index([phoneE164])
+  @@map("membership_applications")
+}
+
+model MembershipStatusHistory {
+  id            String             @id @default(uuid()) @db.Uuid
+  applicationId String             @map("application_id") @db.Uuid
+  fromStatus    ApplicationStatus? @map("from_status")
+  toStatus      ApplicationStatus  @map("to_status")
+  changedById   String?            @map("changed_by_id") @db.Uuid
+  note          String?
+  createdAt     DateTime           @default(now()) @map("created_at") @db.Timestamptz
+  application   MembershipApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  changedBy     User?              @relation(fields: [changedById], references: [id], onDelete: SetNull)
+
+  @@index([applicationId, createdAt])
+  @@map("membership_status_history")
+}
+
+enum MembershipStatus {
+  ACTIVE
+  EXPIRED
+  SUSPENDED
+  CANCELLED
+}
+
+model Membership {
+  id               String           @id @default(uuid()) @db.Uuid
+  membershipNo     String           @unique @map("membership_no")
+  applicationId    String           @unique @map("application_id") @db.Uuid
+  planId           String           @map("plan_id") @db.Uuid
+  fullName         String           @map("full_name")
+  email            String
+  phoneE164        String           @map("phone_e164")
+  status           MembershipStatus @default(ACTIVE)
+  startsAt         DateTime         @map("starts_at") @db.Timestamptz
+  expiresAt        DateTime?        @map("expires_at") @db.Timestamptz
+  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime         @updatedAt @map("updated_at") @db.Timestamptz
+  application      MembershipApplication @relation(fields: [applicationId], references: [id], onDelete: Restrict)
+  plan             MembershipPlan   @relation(fields: [planId], references: [id], onDelete: Restrict)
+
+  @@index([status, planId])
+  @@index([email])
+  @@index([expiresAt])
+  @@map("memberships")
+}
+
+// ───────────────────────────── Events ─────────────────────────────
+
+enum EventType {
+  CLUB_RUN
+  MARATHON
+  TRAINING
+  SOCIAL
+  VOLUNTEER
+  OTHER
+}
+
+enum EventStatus {
+  DRAFT
+  PUBLISHED
+  CANCELLED
+  COMPLETED
+}
+
+model Event {
+  id                     String      @id @default(uuid()) @db.Uuid
+  slug                   String      @unique
+  title                  String
+  summary                String
+  description            String      // Markdown
+  type                   EventType   @default(CLUB_RUN)
+  status                 EventStatus @default(DRAFT)
+  startsAt               DateTime    @map("starts_at") @db.Timestamptz
+  endsAt                 DateTime?   @map("ends_at") @db.Timestamptz
+  venueName              String      @map("venue_name")
+  venueAddress           String?     @map("venue_address")
+  city                   String
+  mapUrl                 String?     @map("map_url")
+  routeDescription       String?     @map("route_description")
+  routeMapUrl            String?     @map("route_map_url")
+  eligibility            String?
+  terms                  String?
+  waiverText             String?     @map("waiver_text")
+  medicalDeclarationText String?     @map("medical_declaration_text")
+  cancellationPolicy     String?     @map("cancellation_policy")
+  // [{ "time": "05:00", "label": "Bib collection" }]
+  schedule               Json        @default("[]")
+  currency               String      @default("INR") @db.Char(3)
+  registrationEnabled    Boolean     @default(false) @map("registration_enabled")
+  registrationOpensAt    DateTime?   @map("registration_opens_at") @db.Timestamptz
+  registrationClosesAt   DateTime?   @map("registration_closes_at") @db.Timestamptz
+  capacity               Int?        // overall cap across all categories; null = unlimited
+  registeredCount        Int         @default(0) @map("registered_count")
+  waitlistEnabled        Boolean     @default(false) @map("waitlist_enabled")
+  volunteersEnabled      Boolean     @default(false) @map("volunteers_enabled")
+  collectDateOfBirth     Boolean     @default(false) @map("collect_date_of_birth")
+  collectGender          Boolean     @default(false) @map("collect_gender")
+  collectTshirtSize      Boolean     @default(false) @map("collect_tshirt_size")
+  tshirtSizes            String[]    @default([]) @map("tshirt_sizes")
+  coverId                String?     @map("cover_id") @db.Uuid
+  cancelledReason        String?     @map("cancelled_reason")
+  createdAt              DateTime    @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt              DateTime    @updatedAt @map("updated_at") @db.Timestamptz
+
+  cover         MediaAsset?         @relation(fields: [coverId], references: [id], onDelete: SetNull)
+  categories    EventCategory[]
+  registrations EventRegistration[]
+  customFields  EventCustomField[]
+
+  @@index([status, startsAt])
+  @@index([type, startsAt])
+  @@map("events")
+}
+
+model EventCategory {
+  id              String   @id @default(uuid()) @db.Uuid
+  eventId         String   @map("event_id") @db.Uuid
+  name            String
+  distanceKm      Decimal? @map("distance_km") @db.Decimal(6, 3)
+  description     String?
+  feeMinor        Int      @map("fee_minor")
+  capacity        Int?
+  registeredCount Int      @default(0) @map("registered_count")
+  minAge          Int?     @map("min_age")
+  maxAge          Int?     @map("max_age")
+  startTime       String?  @map("start_time")
+  isActive        Boolean  @default(true) @map("is_active")
+  sortOrder       Int      @default(0) @map("sort_order")
+  event           Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  registrations   EventRegistration[]
+
+  @@unique([eventId, name])
+  @@map("event_categories")
+}
+
+enum RegistrationStatus {
+  CONFIRMED
+  PENDING_PAYMENT
+  WAITLISTED
+  CANCELLED
+}
+
+enum ParticipantType {
+  PARTICIPANT
+  VOLUNTEER
+}
+
+model EventRegistration {
+  id                  String             @id @default(uuid()) @db.Uuid
+  registrationNo      String             @unique @map("registration_no")
+  eventId             String             @map("event_id") @db.Uuid
+  categoryId          String?            @map("category_id") @db.Uuid
+  participantType     ParticipantType    @default(PARTICIPANT) @map("participant_type")
+  status              RegistrationStatus
+  // True while this registration occupies a capacity slot (confirmed or held pending payment).
+  holdsSlot           Boolean            @default(false) @map("holds_slot")
+  feeMinor            Int                @map("fee_minor")
+  currency            String             @db.Char(3)
+  fullName            String             @map("full_name")
+  email               String
+  phoneE164           String             @map("phone_e164")
+  dateOfBirth         DateTime?          @map("date_of_birth") @db.Date
+  gender              String?
+  emergencyName       String             @map("emergency_name")
+  emergencyPhone      String             @map("emergency_phone")
+  medicalDeclaredAt   DateTime?          @map("medical_declared_at") @db.Timestamptz
+  medicalNotes        String?            @map("medical_notes") // restricted: event.registrations.restricted
+  tshirtSize          String?            @map("tshirt_size")
+  accessibilityNeeds  String?            @map("accessibility_needs")
+  termsAcceptedAt     DateTime           @map("terms_accepted_at") @db.Timestamptz
+  waiverAcceptedAt    DateTime?          @map("waiver_accepted_at") @db.Timestamptz
+  waitlistedAt        DateTime?          @map("waitlisted_at") @db.Timestamptz
+  attendedAt          DateTime?          @map("attended_at") @db.Timestamptz
+  cancelledAt         DateTime?          @map("cancelled_at") @db.Timestamptz
+  cancelReason        String?            @map("cancel_reason")
+  submittedIp         String?            @map("submitted_ip")
+  createdAt           DateTime           @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt           DateTime           @updatedAt @map("updated_at") @db.Timestamptz
+
+  event     Event                        @relation(fields: [eventId], references: [id], onDelete: Restrict)
+  category  EventCategory?               @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  responses EventCustomFieldResponse[]
+  payments  Payment[]
+
+  @@index([eventId, status])
+  @@index([categoryId, status])
+  @@index([email])
+  @@index([eventId, waitlistedAt])
+  @@map("event_registrations")
+}
+
+enum CustomFieldType {
+  TEXT
+  TEXTAREA
+  NUMBER
+  DATE
+  SELECT
+  CHECKBOX
+}
+
+model EventCustomField {
+  id        String          @id @default(uuid()) @db.Uuid
+  eventId   String          @map("event_id") @db.Uuid
+  key       String
+  label     String
+  type      CustomFieldType @default(TEXT)
+  options   String[]        @default([])
+  required  Boolean         @default(false)
+  helpText  String?         @map("help_text")
+  sortOrder Int             @default(0) @map("sort_order")
+  event     Event           @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  responses EventCustomFieldResponse[]
+
+  @@unique([eventId, key])
+  @@map("event_custom_fields")
+}
+
+model EventCustomFieldResponse {
+  id             String            @id @default(uuid()) @db.Uuid
+  registrationId String            @map("registration_id") @db.Uuid
+  fieldId        String            @map("field_id") @db.Uuid
+  value          String
+  registration   EventRegistration @relation(fields: [registrationId], references: [id], onDelete: Cascade)
+  field          EventCustomField  @relation(fields: [fieldId], references: [id], onDelete: Cascade)
+
+  @@unique([registrationId, fieldId])
+  @@index([fieldId])
+  @@map("event_custom_field_responses")
+}
+
+// ───────────────────────────── Payments ─────────────────────────────
+
+enum PaymentPurpose {
+  MEMBERSHIP
+  EVENT_REGISTRATION
+}
+
+enum PaymentStatus {
+  PENDING             // created internally; provider not contacted (e.g. payments disabled)
+  INITIATED           // provider checkout session created
+  SUCCEEDED
+  FAILED
+  CANCELLED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+model Payment {
+  id                      String         @id @default(uuid()) @db.Uuid
+  reference               String         @unique
+  purpose                 PaymentPurpose
+  membershipApplicationId String?        @map("membership_application_id") @db.Uuid
+  eventRegistrationId     String?        @map("event_registration_id") @db.Uuid
+  amountMinor             Int            @map("amount_minor")
+  refundedMinor           Int            @default(0) @map("refunded_minor")
+  currency                String         @db.Char(3)
+  status                  PaymentStatus  @default(PENDING)
+  provider                String?
+  providerCheckoutId      String?        @map("provider_checkout_id")
+  providerPaymentId       String?        @map("provider_payment_id")
+  checkoutUrl             String?        @map("checkout_url")
+  failureReason           String?        @map("failure_reason")
+  paidAt                  DateTime?      @map("paid_at") @db.Timestamptz
+  createdAt               DateTime       @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt               DateTime       @updatedAt @map("updated_at") @db.Timestamptz
+
+  membershipApplication MembershipApplication? @relation(fields: [membershipApplicationId], references: [id], onDelete: Restrict)
+  eventRegistration     EventRegistration?     @relation(fields: [eventRegistrationId], references: [id], onDelete: Restrict)
+  refunds               Refund[]
+
+  @@index([status, createdAt])
+  @@index([membershipApplicationId])
+  @@index([eventRegistrationId])
+  @@index([provider, providerCheckoutId])
+  @@index([provider, providerPaymentId])
+  @@map("payments")
+}
+
+model PaymentWebhookEvent {
+  id              String    @id @default(uuid()) @db.Uuid
+  provider        String
+  providerEventId String    @map("provider_event_id")
+  eventType       String    @map("event_type")
+  signatureValid  Boolean   @map("signature_valid")
+  payload         Json
+  processedAt     DateTime? @map("processed_at") @db.Timestamptz
+  processingError String?   @map("processing_error")
+  receivedAt      DateTime  @default(now()) @map("received_at") @db.Timestamptz
+
+  @@unique([provider, providerEventId])
+  @@map("payment_webhook_events")
+}
+
+enum RefundStatus {
+  REQUESTED
+  SUCCEEDED
+  FAILED
+}
+
+model Refund {
+  id               String       @id @default(uuid()) @db.Uuid
+  paymentId        String       @map("payment_id") @db.Uuid
+  amountMinor      Int          @map("amount_minor")
+  status           RefundStatus @default(REQUESTED)
+  reason           String?
+  providerRefundId String?      @map("provider_refund_id")
+  createdById      String?      @map("created_by_id") @db.Uuid
+  createdAt        DateTime     @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime     @updatedAt @map("updated_at") @db.Timestamptz
+  payment          Payment      @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  createdBy        User?        @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([paymentId])
+  @@map("refunds")
+}
+
+// ───────────────────────────── Notifications ─────────────────────────────
+
+enum Channel {
+  EMAIL
+  WHATSAPP
+}
+
+enum MessageCategory {
+  OPERATIONAL  // transactional / service messages: always sent when the contact exists
+  PROMOTIONAL  // optional announcements & marketing: requires opt-in consent
+}
+
+model NotificationTemplate {
+  id                   String          @id @default(uuid()) @db.Uuid
+  key                  String
+  channel              Channel
+  name                 String
+  description          String?
+  category             MessageCategory @default(OPERATIONAL)
+  subject              String?
+  bodyHtml             String?         @map("body_html")
+  bodyText             String          @map("body_text")
+  // WhatsApp: name/language of the template approved in WhatsApp Manager and the
+  // ordered list of variable names mapped to {{1}}, {{2}}, ...
+  whatsappTemplateName String?         @map("whatsapp_template_name")
+  whatsappLanguage     String?         @map("whatsapp_language")
+  whatsappParams       String[]        @default([]) @map("whatsapp_params")
+  isActive             Boolean         @default(true) @map("is_active")
+  updatedAt            DateTime        @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@unique([key, channel])
+  @@map("notification_templates")
+}
+
+enum CampaignStatus {
+  DRAFT
+  SCHEDULED
+  SENDING
+  COMPLETED
+  CANCELLED
+}
+
+model NotificationCampaign {
+  id                   String          @id @default(uuid()) @db.Uuid
+  title                String
+  subject              String?
+  bodyText             String          @map("body_text")
+  bodyHtml             String?         @map("body_html")
+  whatsappTemplateName String?         @map("whatsapp_template_name")
+  whatsappLanguage     String?         @map("whatsapp_language")
+  channels             Channel[]
+  category             MessageCategory @default(PROMOTIONAL)
+  // { "type": "ALL_ACTIVE_MEMBERS" | "PLAN" | "EVENT_PARTICIPANTS" | "EVENT_VOLUNTEERS" | "ALL_APPROVED_OR_ACTIVE", "planId"?, "eventId"? }
+  audience             Json
+  status               CampaignStatus  @default(DRAFT)
+  scheduledAt          DateTime?       @map("scheduled_at") @db.Timestamptz
+  dispatchedAt         DateTime?       @map("dispatched_at") @db.Timestamptz
+  completedAt          DateTime?       @map("completed_at") @db.Timestamptz
+  recipientCount       Int             @default(0) @map("recipient_count")
+  createdById          String?         @map("created_by_id") @db.Uuid
+  createdAt            DateTime        @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt            DateTime        @updatedAt @map("updated_at") @db.Timestamptz
+  createdBy            User?           @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  deliveries           NotificationDelivery[]
+
+  @@index([status, scheduledAt])
+  @@map("notification_campaigns")
+}
+
+enum DeliveryStatus {
+  QUEUED
+  SENDING
+  SENT       // accepted by provider
+  DELIVERED  // confirmed by provider webhook
+  READ
+  FAILED
+  SKIPPED    // no consent, channel disabled, or missing contact
+  CANCELLED
+}
+
+model NotificationDelivery {
+  id                String          @id @default(uuid()) @db.Uuid
+  idempotencyKey    String          @unique @map("idempotency_key")
+  campaignId        String?         @map("campaign_id") @db.Uuid
+  templateKey       String?         @map("template_key")
+  channel           Channel
+  category          MessageCategory
+  recipientName     String?         @map("recipient_name")
+  recipientEmail    String?         @map("recipient_email")
+  recipientPhone    String?         @map("recipient_phone")
+  subject           String?
+  bodyText          String          @map("body_text")
+  bodyHtml          String?         @map("body_html")
+  // WhatsApp template payload { name, language, params[] }
+  whatsappTemplate  Json?           @map("whatsapp_template")
+  status            DeliveryStatus  @default(QUEUED)
+  attempts          Int             @default(0)
+  nextAttemptAt     DateTime        @default(now()) @map("next_attempt_at") @db.Timestamptz
+  lastError         String?         @map("last_error")
+  providerMessageId String?         @map("provider_message_id")
+  relatedType       String?         @map("related_type")
+  relatedId         String?         @map("related_id")
+  sentAt            DateTime?       @map("sent_at") @db.Timestamptz
+  deliveredAt       DateTime?       @map("delivered_at") @db.Timestamptz
+  createdAt         DateTime        @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt         DateTime        @updatedAt @map("updated_at") @db.Timestamptz
+  campaign          NotificationCampaign? @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@index([status, nextAttemptAt])
+  @@index([campaignId, status])
+  @@index([providerMessageId])
+  @@index([relatedType, relatedId])
+  @@map("notification_deliveries")
+}
+
+enum ConsentChannel {
+  EMAIL_MARKETING
+  WHATSAPP
+}
+
+model ConsentRecord {
+  id        String         @id @default(uuid()) @db.Uuid
+  email     String?
+  phoneE164 String?        @map("phone_e164")
+  channel   ConsentChannel
+  granted   Boolean
+  source    String         // membership_form | event_form | unsubscribe_link | whatsapp_stop | admin
+  sourceRef String?        @map("source_ref")
+  ip        String?
+  createdAt DateTime       @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([email, channel, createdAt])
+  @@index([phoneE164, channel, createdAt])
+  @@map("consent_records")
+}
+
+// ───────────────────────────── Operations ─────────────────────────────
+
+enum ContactStatus {
+  NEW
+  READ
+  ARCHIVED
+}
+
+model ContactMessage {
+  id        String        @id @default(uuid()) @db.Uuid
+  name      String
+  email     String
+  phone     String?
+  subject   String
+  message   String
+  status    ContactStatus @default(NEW)
+  ip        String?
+  createdAt DateTime      @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([status, createdAt])
+  @@map("contact_messages")
+}
+
+model AuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  actorId    String?  @map("actor_id") @db.Uuid
+  action     String
+  entityType String   @map("entity_type")
+  entityId   String?  @map("entity_id")
+  metadata   Json     @default("{}")
+  ip         String?
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+  actor      User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([entityType, entityId])
+  @@index([actorId, createdAt])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// Monotonic per-year counters used to build human-readable reference numbers.
+model ReferenceCounter {
+  scope String @id // e.g. "M-2026", "E-2026", "PAY-2026", "MEM"
+  value Int    @default(0)
+
+  @@map("reference_counters")
+}
